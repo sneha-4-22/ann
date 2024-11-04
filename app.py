@@ -77,7 +77,7 @@ class DualPathwayObjectDetection(nn.Module):
         class_pred = yolo_output[:, :, 5:]  # [B, A, C, H, W]
         
         # Concatenate for final output
-        output = torch.cat([box_coords, objectness, class_pred], dim=2)
+        output = torch.cat([box_coords, objectness, class_pred], dim=2).requires_grad_()
         
         return output
     
@@ -384,7 +384,7 @@ class Trainer:
                     boxes = boxes.to(self.device)
                     targets = targets.to(self.device)
                     
-                    predictions = self.model(images)
+                    predictions = self.model(images).requires_grad_()
                     
                     loss, loss_dict = self.compute_loss(predictions, targets, boxes, valid_boxes_mask)
                     
@@ -579,7 +579,7 @@ def main():
     num_classes = len(config['names'])
     
     BATCH_SIZE = 8
-    NUM_EPOCHS = 50
+    NUM_EPOCHS = 5 # here i di 5 coz while doing 50  is was throwing error while on 10 sooee...
     IMAGE_SIZE = 640
     
     train_transform = A.Compose([
