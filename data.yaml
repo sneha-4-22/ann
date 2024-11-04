@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 5
+names: ['door', 'floor', 'moving-obj', 'object', 'wall']
+
+roboflow:
+  workspace: ann-iyxvg
+  project: doors-and-walls-object-detection
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/ann-iyxvg/doors-and-walls-object-detection/dataset/1
