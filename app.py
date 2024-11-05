@@ -60,7 +60,6 @@ class DualPathwayObjectDetection(nn.Module):
         
         # Get pathway outputs
         yolo_output = self.yolo_pathway(features)
-        ssd_output = self.ssd_pathway(features)
         
         # Get dimensions
         batch_size = x.size(0)
@@ -69,18 +68,17 @@ class DualPathwayObjectDetection(nn.Module):
         # Reshape YOLO output with proper dimension calculation
         yolo_output = yolo_output.permute(0, 2, 3, 1).contiguous()
         yolo_output = yolo_output.view(batch_size, H, W, self.num_anchors, self.num_classes + 5)
-        yolo_output = yolo_output.permute(0, 3, 4, 1, 2)  # [B, A, C+5, H, W]
+        yolo_output = yolo_output.permute(0, 3, 4, 1, 2).contiguous()  # [B, A, C+5, H, W]
         
-        # Extract components
+        # Extract components and ensure they require gradients
         box_coords = yolo_output[:, :, :4]  # [B, A, 4, H, W]
         objectness = yolo_output[:, :, 4:5]  # [B, A, 1, H, W]
         class_pred = yolo_output[:, :, 5:]  # [B, A, C, H, W]
         
-        # Concatenate for final output
-        output = torch.cat([box_coords, objectness, class_pred], dim=2).requires_grad_()
+        # Concatenate for final output and ensure gradients are maintained
+        output = torch.cat([box_coords, objectness, class_pred], dim=2)
         
         return output
-    
 def compute_loss(self, predictions, targets, boxes, valid_boxes_mask):
     """
     Compute the combined loss for object detection
@@ -226,84 +224,89 @@ class Trainer:
         )
     
     def compute_loss(self, predictions, targets, boxes, valid_boxes_mask):
-        """
-        Compute the combined loss for object detection
-        Args:
-            predictions: shape [batch_size, num_anchors, (4 + 1 + num_classes), H, W]
-            targets: shape [batch_size, max_boxes]
-            boxes: shape [batch_size, max_boxes, 4]
-            valid_boxes_mask: shape [batch_size, max_boxes]
-        """
         batch_size = predictions.size(0)
         
         # Extract components from predictions
-        pred_boxes = predictions[:, :, :4]  # [batch_size, num_anchors, 4, H, W]
-        pred_obj = predictions[:, :, 4]     # [batch_size, num_anchors, H, W]
-        pred_cls = predictions[:, :, 5:]    # [batch_size, num_anchors, num_classes, H, W]
+        pred_boxes = predictions[:, :, :4].clone()  # Clone to ensure gradient computation
+        pred_obj = predictions[:, :, 4].clone()
+        pred_cls = predictions[:, :, 5:].clone()
         
-        # Initialize loss components
-        box_loss = torch.tensor(0.0, device=self.device)
-        obj_loss = torch.tensor(0.0, device=self.device)
-        cls_loss = torch.tensor(0.0, device=self.device)
+        # Initialize loss components on the correct device
+        box_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        obj_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        cls_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         total_valid_boxes = 0
+        
+        # Convert valid_boxes_mask to boolean tensor
+        valid_boxes_mask = valid_boxes_mask.bool()
         
         # Process each item in batch
         for b in range(batch_size):
             # Get valid boxes for this batch item
             valid_mask = valid_boxes_mask[b]
-            valid_boxes = boxes[b, valid_mask]
-            valid_targets = targets[b, valid_mask]
+            valid_boxes = boxes[b][valid_mask]
+            valid_targets = targets[b][valid_mask]
             
-            if len(valid_boxes) == 0:
+            if valid_boxes.numel() == 0:
                 continue
             
             # Reshape predictions for this batch item
-            # [num_anchors, 4, H, W] -> [num_anchors * H * W, 4]
-            batch_pred_boxes = pred_boxes[b].permute(0, 2, 3, 1).reshape(-1, 4)
-            # [num_anchors, H, W] -> [num_anchors * H * W]
-            batch_pred_obj = pred_obj[b].reshape(-1)
-            # [num_anchors, num_classes, H, W] -> [num_anchors * H * W, num_classes]
-            batch_pred_cls = pred_cls[b].permute(0, 2, 3, 1).reshape(-1, pred_cls.size(2))
+            batch_pred_boxes = pred_boxes[b].permute(0, 2, 3, 1).contiguous().view(-1, 4)
+            batch_pred_obj = pred_obj[b].contiguous().view(-1)
+            batch_pred_cls = pred_cls[b].permute(0, 2, 3, 1).contiguous().view(-1, pred_cls.size(2))
             
-            # Compute IoU between predictions and ground truth boxes
-            ious = box_iou(batch_pred_boxes, valid_boxes)  # [num_anchors*H*W, num_valid_boxes]
-            
-            # For each ground truth box, find the best matching prediction
-            best_ious, best_n = ious.max(dim=0)  # [num_valid_boxes]
-            
-            # Compute box regression loss
-            box_loss += F.mse_loss(
-                batch_pred_boxes[best_n],
-                valid_boxes,
-                reduction='sum'
-            )
-            
-            # Compute objectness loss
-            obj_targets = torch.zeros_like(batch_pred_obj)
-            obj_targets[best_n] = 1.0
-            obj_loss += F.binary_cross_entropy_with_logits(
-                batch_pred_obj,
-                obj_targets,
-                reduction='sum'
-            )
-            
-            # Compute classification loss
-            cls_loss += F.cross_entropy(
-                batch_pred_cls[best_n],
-                valid_targets,
-                reduction='sum'
-            )
-            
-            total_valid_boxes += len(valid_boxes)
+            try:
+                # Compute IoU between predictions and ground truth boxes
+                ious = box_iou(batch_pred_boxes, valid_boxes)
+                
+                # For each ground truth box, find the best matching prediction
+                best_ious, best_n = ious.max(dim=0)
+                
+                # Compute box regression loss
+                box_loss = box_loss + F.mse_loss(
+                    batch_pred_boxes[best_n],
+                    valid_boxes,
+                    reduction='sum'
+                )
+                
+                # Compute objectness loss
+                obj_targets = torch.zeros_like(batch_pred_obj, device=self.device)
+                obj_targets[best_n] = 1.0
+                obj_loss = obj_loss + F.binary_cross_entropy_with_logits(
+                    batch_pred_obj,
+                    obj_targets,
+                    reduction='sum'
+                )
+                
+                # Compute classification loss
+                cls_loss = cls_loss + F.cross_entropy(
+                    batch_pred_cls[best_n],
+                    valid_targets,
+                    reduction='sum'
+                )
+                
+                total_valid_boxes += len(valid_boxes)
+                
+            except RuntimeError as e:
+                print(f"Error in batch {b}:")
+                print(f"Pred boxes shape: {batch_pred_boxes.shape}")
+                print(f"Valid boxes shape: {valid_boxes.shape}")
+                print(f"Valid targets shape: {valid_targets.shape}")
+                raise e
         
         # Normalize losses
         eps = 1e-6
-        box_loss = box_loss / (total_valid_boxes + eps)
-        obj_loss = obj_loss / (total_valid_boxes + eps)
-        cls_loss = cls_loss / (total_valid_boxes + eps)
+        if total_valid_boxes > 0:
+            box_loss = box_loss / total_valid_boxes
+            obj_loss = obj_loss / total_valid_boxes
+            cls_loss = cls_loss / total_valid_boxes
+        else:
+            box_loss = box_loss * 0
+            obj_loss = obj_loss * 0
+            cls_loss = cls_loss * 0
         
         # Combine losses with weights
-        total_loss = box_loss * 5.0 + obj_loss * 1.0 + cls_loss * 1.0
+        total_loss = (box_loss * 5.0 + obj_loss * 1.0 + cls_loss * 1.0).requires_grad_()
         
         return total_loss, {
             'box_loss': box_loss.item(),
@@ -311,7 +314,6 @@ class Trainer:
             'cls_loss': cls_loss.item(),
             'total_loss': total_loss.item()
         }
-
     def box_iou(box1, box2):
         """
         Compute IoU between two sets of boxes
@@ -579,7 +581,7 @@ def main():
     num_classes = len(config['names'])
     
     BATCH_SIZE = 8
-    NUM_EPOCHS = 5 # here i di 5 coz while doing 50  is was throwing error while on 10 sooee...
+    NUM_EPOCHS = 50 # here i di 5 coz while doing 50  is was throwing error while on 10 sooee...
     IMAGE_SIZE = 640
     
     train_transform = A.Compose([
